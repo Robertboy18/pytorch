@@ -5770,6 +5770,178 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(len(gmm.mean.shape), 2)
 
 
+class TestKLNormal(TestCase):
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize(
+        "scale_case",
+        ["reported", "normal_range", "square_underflow", "ratio_underflow", "large_q"],
+    )
+    def test_kl_normal_scale_range(self, device, dtype, scale_case):
+        finfo = torch.finfo(dtype)
+        scales = {
+            "reported": (1e-4, 1.0),
+            "normal_range": (0.125, 1024.0),
+            "square_underflow": (finfo.tiny, 1.0),
+            "ratio_underflow": (finfo.tiny, finfo.max),
+            "large_q": (0.125, finfo.max),
+        }
+        p_scale, q_scale = (
+            torch.tensor(s, device=device, dtype=dtype, requires_grad=True)
+            for s in scales[scale_case]
+        )
+        actual = kl_divergence(Normal(0, p_scale), Normal(0, q_scale))
+        # Use the stored scales, including rounding of the float16 input.
+        a, b = p_scale.item(), q_scale.item()
+        ratio = a / b
+        expected = math.log(b) - math.log(a) + 0.5 * (ratio**2 - 1)
+        expected_grads = (ratio / b - 1 / a, (1 - ratio**2) / b)
+        self.assertTrue(torch.isfinite(actual))
+        self.assertEqual(actual, torch.tensor(expected, device=device, dtype=dtype))
+        for actual_grad, expected_grad in zip(
+            grad(actual, (p_scale, q_scale)), expected_grads
+        ):
+            self.assertTrue(torch.isfinite(actual_grad))
+            self.assertEqual(
+                actual_grad, torch.tensor(expected_grad, device=device, dtype=dtype)
+            )
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize(
+        "scales",
+        [(0.125, 1024.0), (0.125, 32.0), (0.5, 2.0), (2.0, 0.5), (1.0, 1.0)],
+    )
+    @parametrize("locs", [(0.0, 0.0), (0.25, -0.5)])
+    def test_kl_normal_derivatives(self, device, dtype, scales, locs):
+        a, b = scales
+        delta = locs[0] - locs[1]
+        params = tuple(
+            torch.tensor(x, device=device, dtype=dtype, requires_grad=True)
+            for x in (locs[0], a, locs[1], b)
+        )
+
+        def kl(p_loc, p_scale, q_loc, q_scale):
+            return kl_divergence(Normal(p_loc, p_scale), Normal(q_loc, q_scale))
+
+        expected_grad = torch.tensor(
+            [
+                delta / b**2,
+                a / b**2 - 1 / a,
+                -delta / b**2,
+                1 / b - (a**2 + delta**2) / b**3,
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        expected_hessian = torch.tensor(
+            [
+                [1 / b**2, 0, -1 / b**2, -2 * delta / b**3],
+                [0, 1 / b**2 + 1 / a**2, 0, -2 * a / b**3],
+                [-1 / b**2, 0, 1 / b**2, 2 * delta / b**3],
+                [
+                    -2 * delta / b**3,
+                    -2 * a / b**3,
+                    2 * delta / b**3,
+                    -1 / b**2 + 3 * (a**2 + delta**2) / b**4,
+                ],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        actual_grad = torch.stack(grad(kl(*params), params))
+        actual_hessian = torch.stack(
+            [torch.stack(row) for row in torch.autograd.functional.hessian(kl, params)]
+        )
+        self.assertEqual(actual_grad, expected_grad)
+        self.assertEqual(actual_hessian, expected_hessian)
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("scale_case", ["tiny", "unit", "large"])
+    def test_kl_normal_equal(self, device, dtype, scale_case):
+        finfo = torch.finfo(dtype)
+        scale = {"tiny": finfo.tiny, "unit": 1.0, "large": finfo.max}[scale_case]
+        params = tuple(
+            torch.tensor(x, device=device, dtype=dtype, requires_grad=True)
+            for x in (0.0, scale, 0.0, scale)
+        )
+        actual = kl_divergence(Normal(*params[:2]), Normal(*params[2:]))
+        self.assertEqual(actual, torch.zeros_like(actual), atol=0, rtol=0)
+        for actual_grad in grad(actual, params):
+            self.assertEqual(actual_grad, torch.zeros_like(actual_grad), atol=0, rtol=0)
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("exponent", [-10, 0, 10])
+    def test_kl_normal_near_equal(self, device, dtype, exponent):
+        scale = 2.0**exponent
+        p_scale = torch.tensor(scale, device=device, dtype=dtype)
+        q_scale = torch.tensor(
+            scale * (1 + 4 * torch.finfo(dtype).eps), device=device, dtype=dtype
+        )
+        actual = kl_divergence(Normal(0, p_scale), Normal(0, q_scale))
+        # Scaling both distributions equally must not change their divergence.
+        expected = kl_divergence(
+            Normal(0, p_scale / scale), Normal(0, q_scale / scale)
+        )
+        self.assertGreaterEqual(actual.item(), 0)
+        self.assertEqual(actual, expected, atol=0, rtol=0)
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("equal", [False, True])
+    def test_kl_normal_subnormal_scale(self, device, dtype, equal):
+        finfo = torch.finfo(dtype)
+        p_scale = torch.tensor(finfo.tiny * finfo.eps, device=device, dtype=dtype)
+        q_scale = p_scale if equal else torch.ones_like(p_scale)
+        actual = kl_divergence(Normal(0, p_scale), Normal(0, q_scale))
+        expected = 0.0 if equal else -math.log(p_scale.item()) - 0.5
+        self.assertEqual(actual, torch.tensor(expected, device=device, dtype=dtype))
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    def test_kl_normal_large_ratio(self, device, dtype):
+        finfo = torch.finfo(dtype)
+        p_scale = torch.tensor(finfo.max, device=device, dtype=dtype)
+        q_scale = torch.tensor(finfo.tiny, device=device, dtype=dtype)
+        self.assertEqual(kl_divergence(Normal(0, p_scale), Normal(0, q_scale)), inf)
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("other_dtype", [torch.float32, torch.float64])
+    def test_kl_normal_broadcast(self, device, dtype, other_dtype):
+        p = Normal(
+            torch.tensor([[0.0], [0.5]], device=device, dtype=dtype),
+            torch.tensor([[0.125], [0.5]], device=device, dtype=dtype),
+        )
+        q = Normal(
+            torch.tensor([0.0, -0.5, 1.0], device=device, dtype=other_dtype),
+            torch.tensor([1.0, 1024.0, 4.0], device=device, dtype=other_dtype),
+        )
+        actual = kl_divergence(p, q)
+        expected = torch.tensor(
+            [
+                [
+                    math.log(b / a) + 0.5 * ((a / b) ** 2 + ((x - y) / b) ** 2 - 1)
+                    for y, b in zip(q.loc.tolist(), q.scale.tolist())
+                ]
+                for x, a in zip(p.loc.flatten().tolist(), p.scale.flatten().tolist())
+            ],
+            device=device,
+            dtype=torch.promote_types(dtype, other_dtype),
+        )
+        self.assertEqual(actual.shape, (2, 3))
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertEqual(actual, expected)
+
+    @dtypes(torch.float64)
+    def test_kl_normal_gradcheck(self, device, dtype):
+        params = tuple(
+            torch.tensor(x, device=device, dtype=dtype, requires_grad=True)
+            for x in ([[0.0], [0.5]], [[0.125], [0.5]], [0.0, -0.5], [2.0, 4.0])
+        )
+
+        def kl(p_loc, p_scale, q_loc, q_scale):
+            return kl_divergence(Normal(p_loc, p_scale), Normal(q_loc, q_scale))
+
+        self.assertTrue(gradcheck(kl, params))
+        self.assertTrue(torch.autograd.gradgradcheck(kl, params))
+
+
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestKL(DistributionsTestCase):
     def setUp(self):
@@ -7462,6 +7634,7 @@ instantiate_device_type_tests(
         "xpu",
     ),
 )
+instantiate_device_type_tests(TestKLNormal, globals())
 
 if __name__ == "__main__" and torch._C.has_lapack:
     TestCase._default_dtype_check_enabled = True

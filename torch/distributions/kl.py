@@ -468,7 +468,13 @@ def _kl_multivariatenormal_multivariatenormal(p, q):
 def _kl_normal_normal(p, q):
     var_ratio = (p.scale / q.scale).pow(2)
     t1 = ((p.loc - q.loc) / q.scale).pow(2)
-    return 0.5 * (var_ratio + t1 - 1 - var_ratio.log())
+    # Avoid logging a subnormal squared ratio, but keep the original expression
+    # for well-scaled ratios to preserve precision near equal scales.
+    use_ratio = (var_ratio >= torch.finfo(var_ratio.dtype).tiny) & var_ratio.isfinite()
+    log_p = torch.where(use_ratio, var_ratio, p.scale).log()
+    log_q = torch.where(use_ratio, 1.0, q.scale.to(var_ratio.dtype)).log()
+    log_var_ratio = torch.where(use_ratio, log_p, 2 * (log_p - log_q))
+    return 0.5 * (var_ratio + t1 - 1 - log_var_ratio)
 
 
 @register_kl(OneHotCategorical, OneHotCategorical)
