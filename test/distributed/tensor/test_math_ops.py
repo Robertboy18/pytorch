@@ -823,6 +823,23 @@ class DistMathOpsTest(DTensorContinuousTestBase):
         self.assertEqual(sharded_out.full_tensor(), out)
 
     @with_comms
+    def test_vector_norm_low_precision(self):
+        # The partial norms of fp16/bf16 shards are reduced in fp32, as on a single device,
+        # and the result keeps the input dtype. A shard norm of 256 squares past fp16's max,
+        # and so does the sum of two shards' squared norms of 200.
+        device_mesh = self.build_device_mesh()
+        for dtype in (torch.float16, torch.bfloat16):
+            for values in ([256.0], [200.0, 200.0]):
+                grad = torch.zeros(4 * self.world_size, dtype=dtype)
+                for i, value in enumerate(values[: self.world_size]):
+                    grad[4 * i] = value
+                sharded_grad = distribute_tensor(grad, device_mesh, [Shard(0)])
+                out = torch.ops.aten.linalg_vector_norm(grad, 2)
+                sharded_out = torch.ops.aten.linalg_vector_norm(sharded_grad, 2)
+                self.assertEqual(sharded_out.dtype, dtype)
+                self.assertEqual(sharded_out.full_tensor(), out)
+
+    @with_comms
     def test_vector_norm_partial(self):
         device_mesh = self.build_device_mesh()
 
